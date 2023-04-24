@@ -2,13 +2,16 @@
 //! "Practical non-blocking unordered lists".
 
 use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::{
+    fmt::Debug,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
-pub trait Key: Send + Sync + PartialEq + Eq {}
-pub trait Value: Send + Sync {}
+pub trait Key: Send + Sync + PartialEq + Eq + Debug {}
+pub trait Value: Send + Sync + Debug {}
 
-impl<T: Send + Sync + PartialEq + Eq> Key for T {}
-impl<T: Send + Sync> Value for T {}
+impl<T: Send + Sync + PartialEq + Eq + Debug> Key for T {}
+impl<T: Send + Sync + Debug> Value for T {}
 
 const STATE_INS: u8 = 1 << 0;
 const STATE_REM: u8 = 1 << 1;
@@ -25,8 +28,6 @@ static CREATED: AtomicUsize = AtomicUsize::new(0);
 static DESTROYED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static UNLINKED: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static DEFER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 #[repr(align(64))]
@@ -59,13 +60,13 @@ where
     }
 }
 
-#[cfg(test)]
 impl<K, V> Drop for Node<K, V>
 where
     K: Key,
     V: Value,
 {
     fn drop(&mut self) {
+        #[cfg(test)]
         DESTROYED.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -226,6 +227,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct NodeIter<'g, K, V>
 where
     K: Key,
@@ -260,26 +262,32 @@ where
         self.curr_ptr = succ_ptr;
     }
 
-    /// Delete the current node and move to the next node.
+    /// Try to delete the current node. Travel next no matter if the current node is deleted,
     ///
     /// Return if this node is reclaimed by this call.
     pub fn delete(&mut self) -> bool {
         assert!(!self.curr_ptr.is_null());
 
-        if is_ptr_marked(self.curr_ptr) {
+        let prev = unsafe { self.prev_ptr.deref() };
+        let curr = unsafe { self.curr_ptr.deref() };
+
+        let curr_ptr = self.curr_ptr;
+        let succ_ptr = curr.next.load(Ordering::Acquire, self.guard);
+
+        // move to next node first
+        self.curr_ptr = succ_ptr;
+
+        if is_ptr_marked(curr_ptr) {
             // another thread is deleting the prev node, skip
             return false;
         }
 
-        let prev = unsafe { self.prev_ptr.deref() };
-        let curr = unsafe { self.curr_ptr.deref() };
-
-        let succ_ptr = curr.next.load(Ordering::Acquire, self.guard);
         if is_ptr_marked(succ_ptr) {
             // another thread is deleting this node, skip
             return false;
         }
 
+        // try to mark this ptr deleting
         if let Err(_) = curr.next.compare_exchange_weak(
             succ_ptr,
             succ_ptr.with_tag(MARK_DEL as usize),
@@ -293,7 +301,7 @@ where
         }
 
         match prev.next.compare_exchange_weak(
-            self.curr_ptr,
+            curr_ptr,
             succ_ptr,
             Ordering::AcqRel,
             Ordering::Relaxed,
@@ -304,24 +312,18 @@ where
                 UNLINKED.fetch_add(1, Ordering::Relaxed);
 
                 // curr node is unlinked, reclaim its memory
-                let to_reclaim_ptr = self.curr_ptr;
+                let to_reclaim_ptr = curr_ptr;
 
-                // move to next node
-                self.prev_ptr = self.curr_ptr;
-                self.curr_ptr = succ_ptr;
-
+                // reclaim memory by EBR
                 unsafe {
-                    self.guard.defer_unchecked(move || {
-                        #[cfg(test)]
-                        DEFER.fetch_add(1, Ordering::Relaxed);
-                        drop(to_reclaim_ptr.to_owned());
-                    });
+                    self.guard.defer_destroy(to_reclaim_ptr);
                 };
 
                 true
             }
             Err(_) => {
-                // another thread si deleting the prev node, abort
+                // another thread is deleting the prev node, abort
+                curr.next.store(succ_ptr, Ordering::Release);
                 false
             }
         }
@@ -363,7 +365,7 @@ mod tests {
             assert_eq!(l.get(&i, &guard), Some(&i));
             drop(guard);
 
-            for _ in 0..1000 {
+            for _ in 0..10000 {
                 let guard = epoch::pin();
                 assert!(l.remove(i, &guard));
                 drop(guard);
@@ -384,12 +386,12 @@ mod tests {
 
         let mut handles = vec![];
 
-        let r = 8;
+        let threads = 16;
 
         let ins = std::time::Instant::now();
 
         let mut s = HashSet::new();
-        for i in 1..(r + 1) {
+        for i in 1..(threads + 1) {
             let l = list.clone();
             s.insert(i);
             handles.push(std::thread::spawn(move || task(i, l)));
@@ -403,7 +405,6 @@ mod tests {
         assert!(!epoch::is_pinned());
 
         let guard = epoch::pin();
-        // list.print(guard);
 
         let mut inlist = 0;
 
@@ -434,19 +435,18 @@ mod tests {
         let created = CREATED.load(Ordering::Relaxed);
         let destroyed = DESTROYED.load(Ordering::Relaxed);
         let unlinked = UNLINKED.load(Ordering::Relaxed);
-        let defer = DEFER.load(Ordering::Relaxed);
         let leaked = created - destroyed - inlist;
         println!(
-            "created: {} destroyed: {} inlist: {} unlinked:{} inlist + unlinked:{}, defer:{} leaked: {}",
+            "created: {} destroyed: {} inlist: {} unlinked:{} inlist + unlinked:{}, leaked: {}",
             created,
             destroyed,
             inlist,
             unlinked,
             inlist + unlinked,
-            defer,
             leaked,
         );
 
+        assert_eq!(inlist, threads as usize);
         assert_eq!(leaked, 0)
     }
 }
