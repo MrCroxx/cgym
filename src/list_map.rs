@@ -7,12 +7,6 @@ use std::{
     sync::atomic::{AtomicU8, Ordering},
 };
 
-pub trait Key: Send + Sync + PartialEq + Eq + Debug {}
-pub trait Value: Send + Sync + Debug {}
-
-impl<T: Send + Sync + PartialEq + Eq + Debug> Key for T {}
-impl<T: Send + Sync + Debug> Value for T {}
-
 const STATE_INS: u8 = 1 << 0;
 const STATE_REM: u8 = 1 << 1;
 const STATE_DAT: u8 = 1 << 2;
@@ -22,6 +16,8 @@ const MARK_DEL: u16 = 0x1;
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+
+use crate::code::{Key, Value};
 #[cfg(test)]
 static CREATED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -71,9 +67,9 @@ where
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 #[repr(align(64))]
-pub struct ListInner<K, V>
+pub struct ListMapInner<K, V>
 where
     K: Key,
     V: Value,
@@ -81,11 +77,17 @@ where
     head: Atomic<Node<K, V>>,
 }
 
-impl<K, V> ListInner<K, V>
+impl<K, V> ListMapInner<K, V>
 where
     K: Key,
     V: Value,
 {
+    pub fn new() -> Self {
+        Self {
+            head: Atomic::null(),
+        }
+    }
+
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
         let node_ptr = Owned::new(Node::new(key, Some(value), STATE_INS)).into_shared(guard);
         let node = unsafe { node_ptr.deref() };
@@ -348,9 +350,9 @@ mod tests {
 
     #[test]
     fn test_concurrent() {
-        let list = Arc::new(ListInner::default());
+        let lm = Arc::new(ListMapInner::new());
 
-        let task = |i: u64, l: Arc<ListInner<u64, u64>>| {
+        let task = |i: u64, l: Arc<ListMapInner<u64, u64>>| {
             // std::thread::sleep(std::time::Duration::from_millis(100));
 
             let guard = epoch::pin();
@@ -365,7 +367,7 @@ mod tests {
             assert_eq!(l.get(&i, &guard), Some(&i));
             drop(guard);
 
-            for _ in 0..10000 {
+            for _ in 0..100000 {
                 let guard = epoch::pin();
                 assert!(l.remove(i, &guard));
                 drop(guard);
@@ -386,13 +388,13 @@ mod tests {
 
         let mut handles = vec![];
 
-        let threads = 16;
+        let threads = 32;
 
         let ins = std::time::Instant::now();
 
         let mut s = HashSet::new();
         for i in 1..(threads + 1) {
-            let l = list.clone();
+            let l = lm.clone();
             s.insert(i);
             handles.push(std::thread::spawn(move || task(i, l)));
         }
@@ -408,7 +410,7 @@ mod tests {
 
         let mut inlist = 0;
 
-        let mut curr_ptr = list.head.load(Ordering::Acquire, &guard);
+        let mut curr_ptr = lm.head.load(Ordering::Acquire, &guard);
         while !curr_ptr.is_null() {
             inlist += 1;
             let curr = unsafe { curr_ptr.deref() };
